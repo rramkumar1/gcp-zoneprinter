@@ -1,0 +1,4 @@
+FROM gcr.io/distroless/static:latest
+
+ADD bin/amd64/cmd /cmd
+ENTRYPOINT ["/cmd"]

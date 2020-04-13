@@ -1,32 +1,37 @@
-// Copyright 2020 Google Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 package main
 
 import (
 	"fmt"
+	"os"
 	"log"
 	"net/http"
 	"strings"
+	"flag"
+	"encoding/json"
+	"sync"
 
 	"cloud.google.com/go/compute/metadata"
 )
 
 var (
+	healthCheckPath = flag.String("health_check_path", "/", "path to serve health checks on")
+	healthCheckPort = flag.Int("health_check_port", 8081, "port to serve health checks on")
+	version = flag.String("version", "1.0", "denotes the version of this app")
+
+	// GCE zone that this server is deployed in.
 	computeZone string
+
+	// supports toggling of health check return code.
+	killed bool
+	lock sync.Mutex
+
+	// port that core traffic is served on.
+	mainPort = 8080
 )
 
 func main() {
+	flag.Parse()
+
 	if !metadata.OnGCE() {
 		log.Println("warn: not running on gce")
 	} else {
@@ -38,13 +43,74 @@ func main() {
 		log.Printf("info: determined zone: %q", zone)
 	}
 
-	log.Println("starting to listen on port 80")
-	http.HandleFunc("/", handle)
-	err := http.ListenAndServe(":80", nil)
-	log.Fatal(err)
+	finished := make(chan bool)
+
+	log.Printf("starting to listen on port %d", mainPort)
+	mainServer := http.NewServeMux()
+	mainServer.HandleFunc("/", handlePing)
+	mainServer.HandleFunc("/ping", handlePing)
+	mainServer.HandleFunc("/location", handleLocation)
+	mainServer.HandleFunc("/toggleKill", handleKill)
+	go func() {
+		portStr := fmt.Sprintf(":%d", mainPort)
+		log.Fatal(http.ListenAndServe(portStr, mainServer))
+	}()
+
+	log.Printf("starting to listen on port %d", *healthCheckPort)
+	hcServer := http.NewServeMux()
+	hcServer.HandleFunc(*healthCheckPath, handleHealthCheck)
+	go func() {
+		portStr := fmt.Sprintf(":%d", *healthCheckPort)
+		log.Fatal(http.ListenAndServe(portStr, hcServer))
+	}()
+
+	<-finished
 }
 
-func handle(w http.ResponseWriter, r *http.Request) {
+type pingResponse struct {
+	Hostname string
+	Version string
+	GCPZone string
+	Backend string
+}
+
+func handlePing(w http.ResponseWriter, r *http.Request) {
+	podHostname, err := os.Hostname()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	pr := &pingResponse{Hostname: r.Host, Version: *version, GCPZone: computeZone, Backend: podHostname}
+	j, err := json.Marshal(pr)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(j)
+}
+
+func handleKill(w http.ResponseWriter, r *http.Request) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	killed = !killed
+	fmt.Fprintf(w, "Successfully toggled kill status")
+}
+
+func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	if !killed {
+		fmt.Fprintf(w, "OK")
+	} else {
+		http.Error(w, "Not OK", http.StatusInternalServerError)
+	}
+}
+
+func handleLocation(w http.ResponseWriter, r *http.Request) {
 	var srcIP string
 	if ipHeader := r.Header.Get("X-Forwarded-For"); ipHeader != "" {
 		srcIP = ipHeader
